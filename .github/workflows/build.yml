@@ -1,0 +1,224 @@
+name: Build installers
+
+# Builds SchoolOS (the client app and SchoolOS Serveur) from the private
+# NickAndriam/schoolOS repo and publishes them here as one release, with the
+# update feeds client.json and server.json that installed copies read.
+# This repo is public, so these builds use no paid GitHub minutes.
+#
+# This file lives in wooddit/schoolos-releases as .github/workflows/build.yml.
+# Its source is docs/operations/release-builder/build.yml in schoolOS: change it
+# there, then copy it here. How-to: docs/operations/RELEASING.md.
+#
+# Start it:
+#   - push a tag v* in NickAndriam/schoolOS (it sends a "build" dispatch here)
+#   - gh workflow run build.yml -R wooddit/schoolos-releases -f ref=v0.2.0
+#   - with -f publish=false: builds and signs everything, publishes nothing (a test)
+#
+# Secrets in this repo:
+#   SCHOOLOS_READ_TOKEN        fine-grained token made by NickAndriam, Contents: Read-only on schoolOS
+#   TAURI_SIGNING_PRIVATE_KEY  the updater signing key (~/.tauri/schoolos-updater.key), no password
+# Variables in this repo (not secret):
+#   LICENCE_PUBLIC_KEY         PEM public key(s) servers verify licences with (A69); unset = free modules only
+#   PLATFORM_URL               platform address for online licence renewal; unset = licence files only
+#
+# Only people with write access can start this (no pull_request trigger), and
+# nothing is cached, so no build output of the private code stays here.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or branch of NickAndriam/schoolOS to build
+        default: main
+      publish:
+        description: Publish a release (off = build only, to test)
+        type: boolean
+        default: true
+  repository_dispatch:
+    types: [build]
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: NickAndriam/schoolOS
+  REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+
+concurrency:
+  group: build-${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+
+jobs:
+  prepare:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SCHOOLOS_READ_TOKEN }}
+          persist-credentials: false
+      - name: Read the version (client and server must match the tag)
+        id: version
+        run: |
+          version=$(node scripts/release-version.mjs)
+          case "$REF" in
+            v[0-9]*) [ "$REF" = "v$version" ] || { echo "::error::Tag $REF but the apps say $version. Run pnpm release:version, commit, tag again."; exit 1; } ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Release notes (the tag's message)
+        run: |
+          notes=$(git for-each-ref --format='%(contents:body)' "refs/tags/$REF" 2>/dev/null | sed '/-----BEGIN PGP SIGNATURE-----/,$d')
+          [ -n "$(echo "$notes" | tr -d '[:space:]')" ] || notes=$(git for-each-ref --format='%(contents:subject)' "refs/tags/$REF" 2>/dev/null)
+          [ -n "$notes" ] || notes="SchoolOS ${{ steps.version.outputs.version }}"
+          printf '%s\n' "$notes" > notes.txt
+          cat notes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.txt
+          retention-days: 3
+      - name: This version isn't published yet
+        if: github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release v${{ steps.version.outputs.version }} already exists. Bump the version (installed copies only move up)."
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The client holds no payload: one universal .dmg for both Mac chips.
+          - { name: Client (Mac), app: desktop, os: macos-latest, target: universal-apple-darwin, slug: mac }
+          - { name: Client (Windows), app: desktop, os: windows-latest, target: "", slug: windows }
+          # The server ships Node.js and PostgreSQL for the chip it was built on (assemble.mjs).
+          - { name: Server (Mac Apple silicon), app: server, os: macos-latest, target: "", slug: mac-apple-silicon }
+          - { name: Server (Mac Intel), app: server, os: macos-15-intel, target: "", slug: mac-intel }
+          - { name: Server (Windows), app: server, os: windows-latest, target: "", slug: windows }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SCHOOLOS_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - run: pnpm install --frozen-lockfile
+
+      - name: Licence key
+        if: matrix.app == 'server'
+        shell: bash
+        env:
+          KEY: ${{ vars.LICENCE_PUBLIC_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            printf '%s\n' "$KEY" > "$RUNNER_TEMP/licence-public.pem"
+            echo "LICENCE_PUBLIC_KEY_FILE=$RUNNER_TEMP/licence-public.pem" >> "$GITHUB_ENV"
+          else
+            echo "::warning::LICENCE_PUBLIC_KEY is not set: this server build can't verify licences (free modules only)."
+          fi
+      - name: Server payload (API, web app, runner, Node.js, PostgreSQL)
+        if: matrix.app == 'server'
+        env:
+          PLATFORM_URL: ${{ vars.PLATFORM_URL }}
+        run: pnpm --filter @schoolos/server payload
+
+      - name: Build and sign
+        working-directory: apps/${{ matrix.app }}
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: pnpm exec tauri build ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Collect, with names that are the same on every release
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="apps/${{ matrix.app }}/src-tauri/target/${{ matrix.target }}/release/bundle"
+          name=$([ "${{ matrix.app }}" = desktop ] && echo SchoolOS || echo SchoolOS-Serveur)
+          base="${name}_${VERSION}_${{ matrix.slug }}"
+          mkdir -p out
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$bundle"/dmg/*.dmg "out/$base.dmg"
+            cp "$bundle"/macos/*.app.tar.gz "out/$base.app.tar.gz"
+            cp "$bundle"/macos/*.app.tar.gz.sig "out/$base.app.tar.gz.sig"
+          else
+            cp "$bundle"/nsis/*-setup.exe "out/$base-setup.exe"
+            cp "$bundle"/nsis/*-setup.exe.sig "out/$base-setup.exe.sig"
+            cp "$bundle"/msi/*.msi "out/$base.msi"
+          fi
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-${{ matrix.slug }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    if: github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Update feeds (client.json, server.json)
+        run: |
+          set -euo pipefail
+          mv out/notes.txt notes.txt
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          entry() { jq -n --arg url "$url/$1" --arg signature "$(cat "out/$1.sig")" '{url: $url, signature: $signature}'; }
+          # feed <name> <Apple silicon file> <Intel file> <Windows file>
+          feed() {
+            jq -n --arg version "$VERSION" --rawfile notes notes.txt --arg pub_date "$now" \
+              --argjson arm "$(entry "$2")" --argjson intel "$(entry "$3")" --argjson win "$(entry "$4")" \
+              '{version: $version, notes: ($notes | rtrimstr("\n")), pub_date: $pub_date,
+                platforms: {"darwin-aarch64": $arm, "darwin-x86_64": $intel, "windows-x86_64": $win}}' > "out/$1.json"
+            cat "out/$1.json"
+          }
+          feed client "SchoolOS_${VERSION}_mac.app.tar.gz" "SchoolOS_${VERSION}_mac.app.tar.gz" "SchoolOS_${VERSION}_windows-setup.exe"
+          feed server "SchoolOS-Serveur_${VERSION}_mac-apple-silicon.app.tar.gz" "SchoolOS-Serveur_${VERSION}_mac-intel.app.tar.gz" "SchoolOS-Serveur_${VERSION}_windows-setup.exe"
+      - name: Release page
+        run: |
+          {
+            cat notes.txt
+            echo
+            echo "## Télécharger / Download"
+            echo
+            echo "| | Mac | Windows |"
+            echo "|---|---|---|"
+            echo "| **SchoolOS** (postes du personnel / staff computers) | [SchoolOS_${VERSION}_mac.dmg](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS_${VERSION}_mac.dmg) (Apple silicon + Intel) | [SchoolOS_${VERSION}_windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS_${VERSION}_windows-setup.exe) |"
+            echo "| **SchoolOS Serveur** (ordinateur serveur / server computer) | [Apple silicon](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_mac-apple-silicon.dmg) · [Intel](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_mac-intel.dmg) | [SchoolOS-Serveur_${VERSION}_windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_windows-setup.exe) |"
+            echo
+            echo "Les applications installées se mettent à jour depuis cette page. / Installed apps update themselves from here."
+          } > body.md
+          cat body.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v$VERSION" out/* -R "$GITHUB_REPOSITORY" --target main --title "SchoolOS $VERSION" --notes-file body.md
