@@ -96,10 +96,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The client holds no payload: one universal .dmg for both Mac chips.
-          - { name: Client (Mac), app: desktop, os: macos-latest, target: universal-apple-darwin, slug: mac }
+          # The client holds no payload: one universal .dmg for both Mac chips, cross-compiled on
+          # the Intel image (GitHub's free Apple silicon Macs are often unavailable for a while).
+          - { name: Client (Mac), app: desktop, os: macos-15-intel, target: universal-apple-darwin, slug: mac }
           - { name: Client (Windows), app: desktop, os: windows-latest, target: "", slug: windows }
-          # The server ships Node.js and PostgreSQL for the chip it was built on (assemble.mjs).
+          # The server ships Node.js and PostgreSQL for the chip it was built on (assemble.mjs),
+          # so the Apple silicon server needs an Apple silicon runner.
           - { name: Server (Mac Apple silicon), app: server, os: macos-latest, target: "", slug: mac-apple-silicon }
           - { name: Server (Mac Intel), app: server, os: macos-15-intel, target: "", slug: mac-intel }
           - { name: Server (Windows), app: server, os: windows-latest, target: "", slug: windows }
