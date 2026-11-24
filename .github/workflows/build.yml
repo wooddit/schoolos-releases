@@ -101,11 +101,13 @@ jobs:
           - { name: Client (Mac), app: desktop, os: macos-15-intel, target: universal-apple-darwin, slug: mac }
           - { name: Client (Windows), app: desktop, os: windows-latest, target: "", slug: windows }
           # The server ships Node.js and PostgreSQL for the chip it was built on (assemble.mjs),
-          # so the Apple silicon server needs an Apple silicon runner.
-          - { name: Server (Mac Apple silicon), app: server, os: macos-latest, target: "", slug: mac-apple-silicon }
+          # so the Apple silicon server needs an Apple silicon runner. Those are often at capacity,
+          # so this build is optional: without it, Apple silicon Macs get the Intel server (Rosetta).
+          - { name: Server (Mac Apple silicon), app: server, os: macos-latest, target: "", slug: mac-apple-silicon, optional: true }
           - { name: Server (Mac Intel), app: server, os: macos-15-intel, target: "", slug: mac-intel }
           - { name: Server (Windows), app: server, os: windows-latest, target: "", slug: windows }
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -179,7 +181,9 @@ jobs:
   publish:
     name: Publish
     needs: [prepare, build]
-    if: github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true'
+    # Runs even when a build failed or was never started: the first step checks
+    # that every required file is there; only the Apple silicon server may be missing.
+    if: always() && needs.prepare.result == 'success' && (github.event_name == 'repository_dispatch' || github.event.inputs.publish == 'true')
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -192,6 +196,17 @@ jobs:
         run: |
           set -euo pipefail
           mv out/notes.txt notes.txt
+          for f in SchoolOS_${VERSION}_mac.dmg SchoolOS_${VERSION}_mac.app.tar.gz SchoolOS_${VERSION}_windows-setup.exe \
+                   SchoolOS-Serveur_${VERSION}_mac-intel.dmg SchoolOS-Serveur_${VERSION}_mac-intel.app.tar.gz SchoolOS-Serveur_${VERSION}_windows-setup.exe; do
+            [ -f "out/$f" ] || { echo "::error::$f is missing: a required build failed. Nothing was published."; exit 1; }
+          done
+          # Apple silicon server: the native build if it ran, else the Intel one (runs with Rosetta).
+          arm="mac-apple-silicon"
+          if [ ! -f "out/SchoolOS-Serveur_${VERSION}_mac-apple-silicon.app.tar.gz" ]; then
+            echo "::warning::No Apple silicon server build (no runner available): Apple silicon Macs get the Intel server."
+            arm="mac-intel"
+          fi
+          echo "ARM_SERVER=$arm" >> "$GITHUB_ENV"
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           entry() { jq -n --arg url "$url/$1" --arg signature "$(cat "out/$1.sig")" '{url: $url, signature: $signature}'; }
@@ -204,7 +219,7 @@ jobs:
             cat "out/$1.json"
           }
           feed client "SchoolOS_${VERSION}_mac.app.tar.gz" "SchoolOS_${VERSION}_mac.app.tar.gz" "SchoolOS_${VERSION}_windows-setup.exe"
-          feed server "SchoolOS-Serveur_${VERSION}_mac-apple-silicon.app.tar.gz" "SchoolOS-Serveur_${VERSION}_mac-intel.app.tar.gz" "SchoolOS-Serveur_${VERSION}_windows-setup.exe"
+          feed server "SchoolOS-Serveur_${VERSION}_${arm}.app.tar.gz" "SchoolOS-Serveur_${VERSION}_mac-intel.app.tar.gz" "SchoolOS-Serveur_${VERSION}_windows-setup.exe"
       - name: Release page
         run: |
           {
@@ -215,8 +230,12 @@ jobs:
             echo "| | Mac | Windows |"
             echo "|---|---|---|"
             echo "| **SchoolOS** (postes du personnel / staff computers) | [SchoolOS_${VERSION}_mac.dmg](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS_${VERSION}_mac.dmg) (Apple silicon + Intel) | [SchoolOS_${VERSION}_windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS_${VERSION}_windows-setup.exe) |"
-            echo "| **SchoolOS Serveur** (ordinateur serveur / server computer) | [Apple silicon](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_mac-apple-silicon.dmg) · [Intel](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_mac-intel.dmg) | [SchoolOS-Serveur_${VERSION}_windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_windows-setup.exe) |"
+            echo "| **SchoolOS Serveur** (ordinateur serveur / server computer) | [Apple silicon](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_${ARM_SERVER}.dmg) · [Intel](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_mac-intel.dmg) | [SchoolOS-Serveur_${VERSION}_windows-setup.exe](https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/SchoolOS-Serveur_${VERSION}_windows-setup.exe) |"
             echo
+            if [ "$ARM_SERVER" = mac-intel ]; then
+              echo "Serveur sur Mac Apple silicon : cette version utilise la version Intel (Rosetta, installé par macOS au premier lancement). / Server on Apple silicon Macs: this release uses the Intel build (Rosetta)."
+              echo
+            fi
             echo "Les applications installées se mettent à jour depuis cette page. / Installed apps update themselves from here."
           } > body.md
           cat body.md
