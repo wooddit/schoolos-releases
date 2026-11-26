@@ -17,6 +17,10 @@ name: Build installers
 # Secrets in this repo:
 #   SCHOOLOS_READ_TOKEN        fine-grained token made by NickAndriam, Contents: Read-only on schoolOS
 #   TAURI_SIGNING_PRIVATE_KEY  the updater signing key (~/.tauri/schoolos-updater.key), no password
+#   MAC_CODESIGN_P12           base64 of ~/.tauri/schoolos-macos-signing.p12: the self-signed certificate
+#                              the Mac client is signed with, so macOS keeps its Local Network
+#                              permission across updates (A94). Never replace it casually.
+#   MAC_CODESIGN_PASSWORD      its password (~/.tauri/schoolos-macos-signing.password)
 # Variables in this repo (not secret):
 #   LICENCE_PUBLIC_KEY         PEM public key(s) servers verify licences with (A69); unset = free modules only
 #   PLATFORM_URL               platform address for online licence renewal; unset = licence files only
@@ -143,6 +147,42 @@ jobs:
         env:
           PLATFORM_URL: ${{ vars.PLATFORM_URL }}
         run: pnpm --filter @schoolos/server payload
+
+      # Mac client: signed with the same self-signed certificate every release (A94).
+      # Unsigned, each update looks like a new app to macOS, which drops its Local
+      # Network permission and the client no longer finds the server. No notarisation.
+      - name: Mac client code signing
+        if: matrix.app == 'desktop' && runner.os == 'macOS'
+        shell: bash
+        env:
+          P12: ${{ secrets.MAC_CODESIGN_P12 }}
+          P12_PASSWORD: ${{ secrets.MAC_CODESIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$P12" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::MAC_CODESIGN_P12 / MAC_CODESIGN_PASSWORD missing: an unsigned Mac client would lose its Local Network permission on update."
+            exit 1
+          fi
+          # Tauri's own APPLE_CERTIFICATE import only accepts Apple-issued certificates,
+          # so the certificate goes into a keychain of our own and Tauri gets its
+          # fingerprint (APPLE_SIGNING_IDENTITY alone: codesign -s <SHA-1>).
+          kc="$RUNNER_TEMP/codesign.keychain-db"
+          kc_pass=$(openssl rand -hex 16)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/codesign.p12"
+          security create-keychain -p "$kc_pass" "$kc"
+          security set-keychain-settings -t 3600 -u "$kc"
+          security unlock-keychain -p "$kc_pass" "$kc"
+          security import "$RUNNER_TEMP/codesign.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/codesign.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # Self-signed, so not "valid" for find-identity -v: take it from the full list.
+          sha=$(security find-identity -p codesigning "$kc" | awk '/"SchoolOS Code Signing"/ { print $2; exit }')
+          if [ -z "$sha" ]; then
+            echo "::error::No \"SchoolOS Code Signing\" identity in MAC_CODESIGN_P12."
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$sha" >> "$GITHUB_ENV"
 
       - name: Build and sign
         working-directory: apps/${{ matrix.app }}
